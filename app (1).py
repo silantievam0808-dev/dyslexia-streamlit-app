@@ -1,329 +1,394 @@
-"""
-Streamlit application for adapting Russian text for readers with dyslexia.
-
-This version provides a more robust approach to both simplification and
-visual annotation.  It leverages a neural text simplification model
-(`ruT5-base-multitask`) to generate a simplified version of the input
-text and uses the `Natasha` library to extract named entities,
-identify the root verb (predicative), and group noun phrases into
-semantic chunks.  The resulting HTML is styled with CSS classes to
-highlight persons, locations, organizations, dates, predicates and
-chunks, following the LARF methodology【216500612612523†L745-L767】.
-
-The app operates in two modes:
-
-  * **Mode A (simplification + annotation):** The text is first
-    simplified by the model and then annotated.
-  * **Mode B (annotation only):** The original text is left
-    untouched and only annotated.  This mode minimizes the risk of
-    semantic drift【216500612612523†L745-L767】.
-
-To run this app locally or deploy it on Streamlit Community Cloud,
-ensure that the dependencies listed in `requirements.txt` are
-installed.  In a resource‑constrained environment (e.g. without GPU
-access) the model will run on CPU; expect some delay for long texts.
-"""
-
-import re
 import html
-import torch
-from typing import Tuple
+import re
+from typing import List, Tuple
 
-# Lazy import of optional libraries.  If these packages are not
-# installed, an ImportError will be thrown at runtime when the
-# respective functions are called.  This allows unit testing of
-# non‑dependent code without installing heavy dependencies.
-try:
-    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-except ImportError:
-    AutoTokenizer = None  # type: ignore
-    AutoModelForSeq2SeqLM = None  # type: ignore
+import streamlit as st
+from razdel import sentenize, tokenize
+from natasha import Segmenter, MorphVocab, NewsEmbedding, NewsNERTagger, Doc
+import pymorphy2
 
-try:
-    from natasha import (
-        Segmenter,
-        MorphVocab,
-        NewsEmbedding,
-        NewsMorphTagger,
-        NewsNERTagger,
-        Doc,
+
+st.set_page_config(
+    page_title="Адаптация текста для пользователей с дислексией",
+    page_icon="📘",
+    layout="wide"
+)
+
+CUSTOM_CSS = """
+<style>
+.result-box {
+    font-size: 22px;
+    line-height: 1.9;
+    background: #ffffff;
+    padding: 24px;
+    border-radius: 16px;
+    border: 1px solid #d9d9d9;
+    margin-top: 12px;
+}
+.ent-person {
+    font-weight: 700;
+    color: #8e24aa;
+}
+.ent-loc {
+    font-weight: 700;
+    color: #1565c0;
+}
+.ent-org {
+    font-weight: 700;
+    color: #2e7d32;
+}
+.ent-date {
+    font-weight: 700;
+    color: #ef6c00;
+}
+.pred {
+    background-color: #fff59d;
+    padding: 2px 4px;
+    border-radius: 4px;
+}
+.chunk {
+    background-color: #f5f5f5;
+    padding: 2px 4px;
+    border-radius: 4px;
+}
+.legend-box {
+    background: #fafafa;
+    border: 1px solid #e5e5e5;
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 12px;
+}
+.small-note {
+    color: #666;
+    font-size: 15px;
+}
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+segmenter = Segmenter()
+morph_vocab = MorphVocab()
+emb = NewsEmbedding()
+ner_tagger = NewsNERTagger(emb)
+morph = pymorphy2.MorphAnalyzer()
+
+
+LEXICAL_REPLACEMENTS = {
+    "избирательное нарушение": "особенность",
+    "овладение навыками": "освоение",
+    "овладению навыками": "освоению",
+    "при сохранении": "хотя сохраняется",
+    "способности к обучению": "способность учиться",
+    "правописание": "написание слов без ошибок",
+    "беглость чтения": "быстрое чтение",
+    "понимание прочитанного": "понимание текста",
+    "когнитивная нагрузка": "умственная нагрузка",
+    "визуальная разметка": "визуальное выделение",
+    "генерация": "создание",
+    "идентификация": "определение",
+    "интерпретация": "объяснение",
+    "дискурсивный": "связанный с построением текста",
+    "осуществление": "проведение",
+    "низкочастотный": "редкий",
+    "лексическая единица": "слово",
+    "номинализация": "отглагольное существительное",
+    "причинно-следственные связи": "связи между причиной и следствием",
+}
+
+
+DISCOURSE_MARKERS = {
+    "однако", "поэтому", "потому что", "следовательно", "таким образом",
+    "например", "кроме того", "при этом", "в результате", "сначала", "затем"
+}
+
+
+def normalize_spaces(text: str) -> str:
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def split_long_sentence(sentence: str, max_words: int = 16) -> str:
+    words = sentence.split()
+    if len(words) <= max_words:
+        return sentence
+
+    separators = [", потому что ", ", так как ", ", однако ", ", но ", ", а также ", "; ", ": "]
+    for sep in separators:
+        if sep in sentence:
+            parts = sentence.split(sep, 1)
+            if len(parts) == 2:
+                left = parts[0].strip()
+                right = parts[1].strip()
+                joiner = ". " if not right[:1].islower() else ". "
+                return left + joiner + right[:1].upper() + right[1:] if right else left
+    return sentence
+
+
+def simplify_sentence(sentence: str) -> str:
+    s = sentence.strip()
+
+    for old, new in LEXICAL_REPLACEMENTS.items():
+        s = re.sub(rf"\b{re.escape(old)}\b", new, s, flags=re.IGNORECASE)
+
+    s = re.sub(
+        r"Проблемы могут включать (.+)",
+        r"У человека могут быть такие трудности: \1",
+        s,
+        flags=re.IGNORECASE
     )
-except ImportError:
-    Segmenter = MorphVocab = NewsEmbedding = NewsMorphTagger = None  # type: ignore
-    NewsNERTagger = Doc = None  # type: ignore
 
-# Streamlit is imported inside main() to allow importing this module
-# without having streamlit installed (e.g. during testing).
+    s = re.sub(
+        r"которые затрагивают точность, скорость или оба этих аспекта",
+        "которые влияют на точность и скорость чтения",
+        s,
+        flags=re.IGNORECASE
+    )
+
+    s = re.sub(
+        r"варьируются в зависимости от особенностей орфографии",
+        "и проявляются по-разному в разных языках",
+        s,
+        flags=re.IGNORECASE
+    )
+
+    s = split_long_sentence(s)
+
+    s = re.sub(r"\s+,", ",", s)
+    s = re.sub(r"\s+\.", ".", s)
+    s = re.sub(r"\s+:", ":", s)
+    s = re.sub(r"\s+;", ";", s)
+    s = re.sub(r"\s{2,}", " ", s)
+
+    return s.strip()
 
 
-class TextAdapter:
-    """
-    Encapsulates the models and methods for simplifying and annotating text.
-    """
+def simplify_text(text: str) -> str:
+    sentences = [s.text.strip() for s in sentenize(normalize_spaces(text))]
+    simplified = [simplify_sentence(s) for s in sentences if s.strip()]
+    result = " ".join(simplified)
+    result = re.sub(r"\s{2,}", " ", result)
+    return result.strip()
 
-    def __init__(self):
-        # Initialize ruT5 model for text simplification
-        if AutoTokenizer is None or AutoModelForSeq2SeqLM is None:
-            raise ImportError(
-                "transformers is required for simplification. Please install it via pip."
-            )
-        model_name = "cointegrated/rut5-base-multitask"
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model.to(self.device)
 
-        # Initialize Natasha for NER and morphological analysis
-        if Segmenter is None:
-            raise ImportError(
-                "Natasha library is required for annotation. Please install it via pip."
-            )
-        self.segmenter = Segmenter()
-        self.morph_vocab = MorphVocab()
-        emb = NewsEmbedding()
-        self.morph_tagger = NewsMorphTagger(emb)
-        self.ner_tagger = NewsNERTagger(emb)
+def get_entities(sentence: str) -> List[Tuple[int, int, str]]:
+    doc = Doc(sentence)
+    doc.segment(segmenter)
+    doc.tag_ner(ner_tagger)
 
-    def simplify_text(self, text: str, max_length: int = 512, num_beams: int = 5) -> str:
-        """
-        Generate a simplified version of Russian text using ruT5.
+    spans = []
+    for span in doc.spans:
+        label = None
+        if span.type == "PER":
+            label = "ent-person"
+        elif span.type == "LOC":
+            label = "ent-loc"
+        elif span.type == "ORG":
+            label = "ent-org"
+        elif span.type == "DATE":
+            label = "ent-date"
 
-        The model is invoked with the "simplify | " prefix as
-        documented for the multitask version【216972154572502†L39-L48】.
+        if label:
+            spans.append((span.start, span.stop, label))
 
-        Args:
-            text: The input text.
-            max_length: Maximum length of the generated sequence.
-            num_beams: Beam width for beam search.
+    for match in re.finditer(r"\b\d{1,4}(?:[./-]\d{1,2}(?:[./-]\d{2,4})?)?\b", sentence):
+        spans.append((match.start(), match.end(), "ent-date"))
 
-        Returns:
-            A simplified version of the input text.
-        """
-        clean = re.sub(r"\s+", " ", text).strip()
-        # Add the multitask prefix for simplification
-        prefix = "simplify | "
-        input_ids = self.tokenizer(
-            prefix + clean,
-            return_tensors="pt",
-            truncation=True,
-            max_length=512,
-        ).to(self.device)
-        with torch.no_grad():
-            output_ids = self.model.generate(
-                **input_ids,
-                max_length=max_length,
-                num_beams=num_beams,
-                no_repeat_ngram_size=2,
-                early_stopping=True,
-            )
-        simplified = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
-        return simplified.strip()
+    spans = sorted(set(spans), key=lambda x: (x[0], x[1]))
+    return spans
 
-    def annotate_text(self, text: str) -> str:
-        """
-        Annotate Russian text with HTML tags following the LARF scheme.
 
-        Steps:
-          1. Segment text into sentences and run morphological and NER
-             analysis via Natasha.
-          2. For each sentence, assign labels to characters:
-             - PERSON, LOC, ORG, DATE from NER
-             - predicate (root verb)
-             - noun phrase (chunk) via POS patterns
-             - mark summarising or unusual sentences
-          3. Insert HTML tags at character boundaries to wrap
-             segments.
+def is_verb(token_text: str) -> bool:
+    parsed = morph.parse(token_text)
+    if not parsed:
+        return False
+    tag = parsed[0].tag
+    return "VERB" in tag or "INFN" in tag
 
-        Args:
-            text: A string containing one or more sentences.
 
-        Returns:
-            Annotated HTML string.
-        """
-        # Split by paragraphs to preserve newlines
-        paragraphs = text.split("\n")
-        annotated_paragraphs = []
-        for para in paragraphs:
-            para = para.strip()
-            if not para:
-                annotated_paragraphs.append("")
+def is_good_chunk_token(token_text: str) -> bool:
+    parsed = morph.parse(token_text)
+    if not parsed:
+        return False
+    pos = parsed[0].tag.POS
+    return pos in {"NOUN", "ADJF", "ADJS", "PRTF", "PRTS", "NUMR"}
+
+
+def get_predicate_span(sentence: str) -> Tuple[int, int] | None:
+    tokens = list(tokenize(sentence))
+
+    for token in tokens:
+        t = token.text
+        if is_verb(t):
+            parsed = morph.parse(t)[0]
+            if parsed.tag.POS == "INFN":
                 continue
-            doc = Doc(para)
-            doc.segment(self.segmenter)
-            doc.tag_morph(self.morph_tagger)
-            doc.tag_ner(self.ner_tagger)
-            sentences = list(doc.sents)
-            total = len(sentences)
-            annotated_sents = []
-            for idx, sent in enumerate(sentences):
-                sent_text = sent.text
-                length = len(sent_text)
-                labels: list[str | None] = [None] * length
-                # 1. NER entities (PERSON, LOC, ORG, DATE)
-                for span in doc.spans:
-                    if span.start >= sent.start and span.stop <= sent.stop:
-                        if span.type in {"PER", "LOC", "ORG", "DATE"}:
-                            start = span.start - sent.start
-                            end = span.stop - sent.start
-                            cls = None
-                            if span.type == "PER":
-                                cls = "ent-person"
-                            elif span.type == "LOC":
-                                cls = "ent-loc"
-                            elif span.type == "ORG":
-                                cls = "ent-org"
-                            elif span.type == "DATE":
-                                cls = "ent-date"
-                            if cls:
-                                for i in range(start, end):
-                                    labels[i] = cls
-                # 2. Predicate (root verb)
-                root = sent.root
-                if root.pos in {"VERB", "AUX"}:
-                    start = root.idx - sent.start_char
-                    end = start + len(root.text)
-                    for i in range(start, end):
-                        if labels[i] is None:
-                            labels[i] = "pred"
-                # 3. Noun phrases (chunk)
-                chunk_tokens = []
-                chunk_spans = []
-                def flush_chunk():
-                    nonlocal chunk_tokens, chunk_spans
-                    if chunk_tokens:
-                        cs = chunk_tokens[0].idx - sent.start_char
-                        ce = (chunk_tokens[-1].idx - sent.start_char) + len(chunk_tokens[-1].text)
-                        chunk_spans.append((cs, ce))
-                        chunk_tokens = []
-                for tok in sent:
-                    if tok.pos in {"ADJ", "NOUN", "PROPN", "NUM"}:
-                        chunk_tokens.append(tok)
-                    else:
-                        flush_chunk()
-                flush_chunk()
-                for start, end in chunk_spans:
-                    for i in range(start, end):
-                        if labels[i] is None:
-                            labels[i] = "chunk"
-                # 4. Summarising sentences (mark) and unusual (underline)
-                summary_keywords = {
-                    "итог", "вывод", "следовательно", "таким образом",
-                    "в заключение", "результат", "таким образом",
-                }
-                mark_sentence = (
-                    idx == 0 or idx == total - 1 or any(kw in sent_text.lower() for kw in summary_keywords)
-                )
-                underline_sentence = bool(re.search(r"[!?«»—]", sent_text))
-                # 5. Build HTML with nested tags
-                html_parts: list[str] = []
-                current_label: str | None = None
-                for pos, ch in enumerate(sent_text):
-                    lbl = labels[pos]
-                    # close tags if necessary
-                    if lbl != current_label:
-                        if current_label is not None:
-                            if current_label.startswith("ent"):
-                                html_parts.append("</b>")
-                            elif current_label == "pred":
-                                html_parts.append("</mark>")
-                            elif current_label == "chunk":
-                                html_parts.append("</span>")
-                        # open new tag
-                        if lbl is not None:
-                            if lbl.startswith("ent"):
-                                html_parts.append(f'<b class="{lbl}">')
-                            elif lbl == "pred":
-                                html_parts.append('<mark class="pred">')
-                            elif lbl == "chunk":
-                                html_parts.append('<span class="chunk">')
-                        current_label = lbl
-                    html_parts.append(html.escape(ch, quote=False))
-                # close last tag
-                if current_label is not None:
-                    if current_label.startswith("ent"):
-                        html_parts.append("</b>")
-                    elif current_label == "pred":
-                        html_parts.append("</mark>")
-                    elif current_label == "chunk":
-                        html_parts.append("</span>")
-                annotated = "".join(html_parts)
-                # wrap summary / underline
-                if mark_sentence:
-                    annotated = f"<mark>{annotated}</mark>"
-                if underline_sentence:
-                    annotated = f"<u>{annotated}</u>"
-                annotated_sents.append(annotated)
-            annotated_paragraphs.append(" ".join(annotated_sents))
-        return "<br>".join(annotated_paragraphs)
+            return token.start, token.stop
 
-    def adapt(self, text: str, mode: str) -> Tuple[str | None, str]:
-        """
-        Adapt text according to the specified mode.
+    for token in tokens:
+        if token.text.lower() in {"может", "могут", "нужно", "следует", "является", "бывает"}:
+            return token.start, token.stop
 
-        Args:
-            text: Input text.
-            mode: "A" or "B".  "A" triggers simplification before
-                  annotation; "B" annotates the original text.
+    return None
 
-        Returns:
-            A tuple (simplified_text, annotated_html).  The first
-            element is None when mode B is selected.
-        """
-        if mode not in {"A", "B"}:
-            raise ValueError("mode must be 'A' or 'B'")
-        if mode == "A":
-            simplified = self.simplify_text(text)
-            annotated = self.annotate_text(simplified)
-            return simplified, annotated
+
+def get_chunk_spans(sentence: str) -> List[Tuple[int, int]]:
+    tokens = list(tokenize(sentence))
+    chunks = []
+    current = []
+
+    for token in tokens:
+        text = token.text
+
+        if text.lower() in DISCOURSE_MARKERS:
+            if current:
+                chunks.append((current[0].start, current[-1].stop))
+                current = []
+            continue
+
+        if is_good_chunk_token(text):
+            current.append(token)
         else:
-            annotated = self.annotate_text(text)
-            return None, annotated
+            if current:
+                if 1 <= len(current) <= 6:
+                    chunks.append((current[0].start, current[-1].stop))
+                current = []
+
+    if current and 1 <= len(current) <= 6:
+        chunks.append((current[0].start, current[-1].stop))
+
+    filtered = []
+    for start, end in chunks:
+        chunk_text = sentence[start:end].strip()
+        if len(chunk_text.split()) >= 2:
+            filtered.append((start, end))
+
+    return filtered
 
 
-def main():
-    # Import streamlit here to avoid a hard dependency when the module is imported
-    import streamlit as st  # type: ignore
-
-    st.set_page_config(
-        page_title="Адаптация текста для пользователей с дислексией",
-        page_icon="📘",
-        layout="wide",
-    )
-    st.title("Нейросетевая адаптация текста для пользователей с дислексией")
-    st.markdown(
-        "Этот прототип демонстрирует два режима работы:\n"
-        "**A** — сначала упрощение текста и затем разметка,\n"
-        "**B** — только разметка (без изменения исходного текста)."
-    )
-    default_text = (
-        "Дислексия — избирательное нарушение способности к овладению навыками "
-        "чтения и письма при сохранении общей способности к обучению. "
-        "Проблемы могут включать трудности с чтением вслух и про себя, "
-        "правописанием, беглостью чтения и пониманием прочитанного."
-    )
-    text_input = st.text_area(
-        "Введите текст для адаптации:", value=default_text, height=200
-    )
-    mode = st.radio(
-        "Выберите режим:",
-        options=["A", "B"],
-        format_func=lambda x: "A — упрощение + разметка" if x == "A" else "B — только разметка",
-        horizontal=True,
-    )
-    if st.button("Адаптировать текст", type="primary"):
-        # Instantiate the adapter on demand to avoid long start time
-        with st.spinner("Загрузка моделей и анализ текста..."):
-            adapter = TextAdapter()
-            simplified, annotated_html = adapter.adapt(text_input, mode)
-        if simplified:
-            st.subheader("Упрощённый текст")
-            st.write(simplified)
-        st.subheader("Результат с визуальной разметкой")
-        st.markdown(
-            f"<div style='font-size:20px; line-height:1.8'>{annotated_html}</div>",
-            unsafe_allow_html=True,
-        )
+def overlaps(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
+    return a_start < b_end and b_start < a_end
 
 
-if __name__ == "__main__":
-    main()
+def build_html(sentence: str) -> str:
+    entities = get_entities(sentence)
+    pred = get_predicate_span(sentence)
+    chunks = get_chunk_spans(sentence)
+
+    labels = [None] * len(sentence)
+
+    for start, end, label in entities:
+        for i in range(start, min(end, len(sentence))):
+            labels[i] = label
+
+    if pred:
+        p_start, p_end = pred
+        for i in range(p_start, min(p_end, len(sentence))):
+            if labels[i] is None:
+                labels[i] = "pred"
+
+    for c_start, c_end in chunks:
+        if pred and overlaps(c_start, c_end, pred[0], pred[1]):
+            continue
+        if any(label and label.startswith("ent-") for label in labels[c_start:c_end]):
+            continue
+        for i in range(c_start, min(c_end, len(sentence))):
+            if labels[i] is None:
+                labels[i] = "chunk"
+
+    parts = []
+    current = None
+
+    open_tags = {
+        "ent-person": '<b class="ent-person">',
+        "ent-loc": '<b class="ent-loc">',
+        "ent-org": '<b class="ent-org">',
+        "ent-date": '<b class="ent-date">',
+        "pred": '<mark class="pred">',
+        "chunk": '<span class="chunk">',
+    }
+
+    close_tags = {
+        "ent-person": "</b>",
+        "ent-loc": "</b>",
+        "ent-org": "</b>",
+        "ent-date": "</b>",
+        "pred": "</mark>",
+        "chunk": "</span>",
+    }
+
+    for i, ch in enumerate(sentence):
+        label = labels[i]
+        if label != current:
+            if current is not None:
+                parts.append(close_tags[current])
+            if label is not None:
+                parts.append(open_tags[label])
+            current = label
+        parts.append(html.escape(ch, quote=False))
+
+    if current is not None:
+        parts.append(close_tags[current])
+
+    return "".join(parts)
+
+
+def annotate_text(text: str) -> str:
+    sentences = [s.text.strip() for s in sentenize(normalize_spaces(text))]
+    rendered = [build_html(s) for s in sentences if s.strip()]
+    return " ".join(rendered)
+
+
+def adapt_text(text: str, mode: str) -> Tuple[str | None, str]:
+    source = normalize_spaces(text)
+
+    if mode == "A":
+        simplified = simplify_text(source)
+        marked = annotate_text(simplified)
+        return simplified, marked
+
+    marked = annotate_text(source)
+    return None, marked
+
+
+st.title("Адаптация текста для пользователей с дислексией")
+st.markdown(
+    """
+<div class="legend-box">
+<b>Режим A</b>: сначала генерируется упрощённый текст, затем к нему применяется визуальная разметка.<br>
+<b>Режим B</b>: на исходный текст накладывается только разметка, без генеративного переписывания.
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+default_text = """Дислексия — избирательное нарушение способности к овладению навыками чтения и письма при сохранении общей способности к обучению. Проблемы могут включать трудности с чтением вслух и про себя, правописанием, беглостью чтения и пониманием прочитанного."""
+
+text = st.text_area("Вставьте текст", value=default_text, height=220)
+
+mode = st.radio(
+    "Выберите режим",
+    options=["A", "B"],
+    format_func=lambda x: "Режим A — упрощение + разметка" if x == "A" else "Режим B — только разметка",
+)
+
+if st.button("Адаптировать текст", type="primary"):
+    simplified_text, marked_html = adapt_text(text, mode)
+
+    if simplified_text is not None:
+        st.subheader("Упрощённый текст")
+        st.write(simplified_text)
+
+    st.subheader("Результат с визуальной разметкой")
+    st.markdown(f'<div class="result-box">{marked_html}</div>', unsafe_allow_html=True)
+
+st.markdown(
+    """
+<p class="small-note">
+Текущий MVP использует облегчённое rule-based упрощение и лингвистическую разметку.
+Это стабильнее для Streamlit Cloud, чем тяжёлые трансформерные модели.
+</p>
+""",
+    unsafe_allow_html=True,
+)
