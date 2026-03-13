@@ -1,5 +1,5 @@
 streamlit
-transformers
-torch>=2.0
 natasha
-sentencepiece
+razdel
+pymorphy2
+pymorphy2-dicts-ru
