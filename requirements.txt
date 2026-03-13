@@ -1,6 +1,4 @@
-streamlit
-natasha
-razdel
-pymorphy2
-pymorphy2-dicts-ru
-setuptools
+streamlit==1.32.0
+natasha==1.6.0
+transformers==4.38.2
+torch==2.2.1
