@@ -1,7 +1,8 @@
 import streamlit as st
 
-st.title("Прототип адаптации текста для пользователей с дислексией")
-st.write("Если ты видишь эту страницу — Streamlit работает.")
-text = st.text_area("Вставь текст сюда")
-if st.button("Показать текст"):
+st.title("Streamlit работает")
+
+text = st.text_area("Введите текст")
+
+if st.button("Показать"):
     st.write(text)
