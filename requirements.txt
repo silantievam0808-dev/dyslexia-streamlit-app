@@ -1,6 +1,6 @@
 streamlit
 natasha
 transformers
-# Устанавливаем CPU-версию torch, чтобы избежать ошибок с CUDA и сэкономить память
 torch --index-url https://download.pytorch.org/whl/cpu
 sentencepiece
+protobuf==3.20.*
