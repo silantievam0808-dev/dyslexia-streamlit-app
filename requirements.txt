@@ -1,6 +1,0 @@
-streamlit
-natasha
-transformers
-torch --index-url https://download.pytorch.org/whl/cpu
-sentencepiece
-protobuf==3.20.*
