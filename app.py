@@ -1,118 +1,93 @@
 import streamlit as st
 from transformers import T5ForConditionalGeneration, T5Tokenizer
 from natasha import (
-    Segmenter, MorphVocab, NewsEmbedding, NewsNERTagger,
-    NamesExtractor, DatesExtractor, Doc
+    Segmenter, MorphVocab, NewsEmbedding, NewsNERTagger, Doc
 )
-import re
+import torch
 
-# --- ИНИЦИАЛИЗАЦИЯ МОДЕЛЕЙ (Кэшируем, чтобы не загружать каждый раз) ---
+# Настройка страницы
+st.set_page_config(page_title="Dyslexia Adapt", layout="wide")
+
+# Кастомный CSS для разметки (согласно вашей работе)
+st.markdown("""
+<style>
+    .per { background-color: #d1e9ff; border-radius: 3px; padding: 2px; font-weight: bold; }
+    .loc { background-color: #ffdee9; border-radius: 3px; padding: 2px; font-weight: bold; }
+    .org { background-color: #e2f0d9; border-radius: 3px; padding: 2px; font-weight: bold; }
+    .main-text { line-height: 1.8; font-size: 1.2rem; letter-spacing: 0.05em; }
+</style>
+""", unsafe_allow_html=True)
+
+# Загрузка легкой модели упрощения
 @st.cache_resource
-def load_simplification_model():
-    # Используем базовую модель ruT5 как placeholder для вашего будущего fine-tuned FRED-T5
+def load_models():
     model_name = "cointegrated/rut5-base-paraphraser"
     tokenizer = T5Tokenizer.from_pretrained(model_name)
     model = T5ForConditionalGeneration.from_pretrained(model_name)
-    return tokenizer, model
-
-@st.cache_resource
-def load_natasha_ner():
-    segmenter = Segmenter()
-    emb = NewsEmbedding()
-    ner_tagger = NewsNERTagger(emb)
-    morph_vocab = MorphVocab()
-    return segmenter, ner_tagger, morph_vocab
-
-# --- ЛОГИКА УПРОЩЕНИЯ (РЕЖИМ A) ---
-def simplify_text(text, tokenizer, model):
-    # Разделение текста на предложения (в идеале использовать razdel, как указано в ВКР)
-    sentences = re.split(r'(?<=[.!?]) +', text)
-    simplified_sentences = []
     
-    for sentence in sentences:
-        if len(sentence) < 3:
-            continue
-        # Генерация упрощенного текста (T5)
-        inputs = tokenizer(sentence, return_tensors="pt", padding=True)
-        outputs = model.generate(
-            **inputs, 
-            max_length=100, 
-            num_beams=3, 
-            repetition_penalty=2.5,
-            early_stopping=True
-        )
-        simplified = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        simplified_sentences.append(simplified)
-        
-    return " ".join(simplified_sentences)
+    # Инициализация Natasha
+    segmenter = Segmenter()
+    ner_tagger = NewsNERTagger(NewsEmbedding())
+    morph_vocab = MorphVocab()
+    
+    return tokenizer, model, segmenter, ner_tagger, morph_vocab
 
-# --- ЛОГИКА РАЗМЕТКИ LARF (РЕЖИМ B И ЧАСТЬ РЕЖИМА A) ---
-def apply_larf_markup(text, segmenter, ner_tagger, morph_vocab):
+tokenizer, model, segmenter, ner_tagger, morph_vocab = load_models()
+
+def simplify_text(text):
+    """Генеративное упрощение (Режим A)"""
+    inputs = tokenizer(text, return_tensors='pt', padding=True)
+    with torch.no_grad():
+        out = model.generate(
+            **inputs, 
+            max_length=150, 
+            do_sample=False, 
+            repetition_penalty=2.5
+        )
+    return tokenizer.decode(out[0], skip_special_tokens=True)
+
+def apply_markup(text):
+    """Визуальная разметка сущностей (Методология LARF)"""
     doc = Doc(text)
     doc.segment(segmenter)
     doc.tag_ner(ner_tagger)
     
-    # Нормализация сущностей
-    for span in doc.spans:
-        span.normalize(morph_vocab)
-        
-    # Сортируем спаны с конца, чтобы при замене индексы не сдвигались
+    # Сортируем сущности с конца, чтобы не нарушить индексы при замене
     spans = sorted(doc.spans, key=lambda x: x.start, reverse=True)
     
-    marked_text = text
+    html_text = text
     for span in spans:
-        # Применяем HTML-теги из вашей таблицы 6
-        if span.type == 'PER':
-            tag_open, tag_close = '<b class="ent-person" style="background-color: #e6f7ff;">', '</b>'
-        elif span.type == 'LOC':
-            tag_open, tag_close = '<b class="ent-loc" style="background-color: #fff0f6;">', '</b>'
-        elif span.type == 'ORG':
-            tag_open, tag_close = '<b class="ent-org" style="background-color: #f6ffed;">', '</b>'
-        else:
-            tag_open, tag_close = '<b>', '</b>'
-            
-        marked_text = marked_text[:span.start] + tag_open + marked_text[span.start:span.stop] + tag_close + marked_text[span.stop:]
-        
-    # Пример добавления <mark> для глаголов или смысловых блоков можно реализовать через морфологический анализ
-    return marked_text
+        label_class = span.type.lower() # per, loc, org
+        start, stop = span.start, span.stop
+        tagged_part = f'<span class="{label_class}">{text[start:stop]}</span>'
+        html_text = html_text[:start] + tagged_part + html_text[stop:]
+    
+    return html_text
 
-# --- ИНТЕРФЕЙС STREAMLIT ---
-st.set_page_config(page_title="Адаптация текстов для дислексиков", layout="wide")
+# Интерфейс
+st.title("Система адаптации текста")
+st.write("Инструмент поддержки чтения на основе упрощения и визуальной разметки.")
 
-st.title("Нейросетевая система адаптации текстов (LARF)")
-st.markdown("Инструмент для лингвистической адаптации и визуальной поддержки чтения[cite: 226].")
-
-# Загрузка моделей
-with st.spinner('Загрузка нейросетевых моделей...'):
-    tokenizer, model = load_simplification_model()
-    segmenter, ner_tagger, morph_vocab = load_natasha_ner()
-
-# Выбор режима
 mode = st.radio(
-    "Выберите режим работы системы:",
-    ("Режим A: Генеративное упрощение + Визуальная разметка", 
-     "Режим B: Только визуальная разметка (LARF)")
+    "Выберите режим методологии:",
+    ["Режим A (Упрощение + Разметка)", "Режим B (Только разметка LARF)"]
 )
 
-source_text = st.text_area("Введите текст для адаптации:", height=200)
+input_text = st.text_area("Введите исходный текст:", height=200)
 
-if st.button("Адаптировать текст"):
-    if source_text.strip():
-        with st.spinner("Обработка текста..."):
+if st.button("Адаптировать"):
+    if input_text:
+        with st.spinner("Обработка..."):
             if "Режим A" in mode:
-                # 1. Упрощение
-                simplified_text = simplify_text(source_text, tokenizer, model)
-                # 2. Разметка
-                final_text = apply_larf_markup(simplified_text, segmenter, ner_tagger, morph_vocab)
-                
-                st.subheader("Результат (Режим A):")
-                st.markdown(final_text, unsafe_allow_html=True)
-                
+                # Сначала упрощаем
+                processed = simplify_text(input_text)
+                # Затем размечаем упрощенный текст
+                final_html = apply_markup(processed)
             else:
-                # Только разметка исходного текста
-                final_text = apply_larf_markup(source_text, segmenter, ner_tagger, morph_vocab)
-                
-                st.subheader("Результат (Режим B - LARF):")
-                st.markdown(final_text, unsafe_allow_html=True)
+                # Режим B: только разметка оригинала
+                final_html = apply_markup(input_text)
+            
+            st.subheader("Адаптированный текст:")
+            st.markdown(f'<div class="main-text">{final_html}</div>', unsafe_allow_html=True)
     else:
-        st.warning("Пожалуйста, введите текст.")
+        st.warning("Введите текст для обработки.")
